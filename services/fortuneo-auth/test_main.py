@@ -1,9 +1,11 @@
 import unittest
+from decimal import Decimal
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 
 from fortuneo_parser import (
+    BALANCE_ONLY_TYPES,
     PortfolioFormatError,
     decimal_value,
     extract_accounts_from_equipment,
@@ -11,6 +13,7 @@ from fortuneo_parser import (
     optional_decimal_value,
     parse_equipment_multipart,
     parse_legacy_account_ids,
+    parse_life_insurance_positions,
     parse_portfolio_positions,
     parse_portfolio_summary,
 )
@@ -261,6 +264,57 @@ class EquipmentGraphqlTest(unittest.TestCase):
         self.assertIsNone(folded[0]["cashBalance"])
         self.assertEqual(folded[1]["cashBalance"], decimal_value("4.7"))
 
+    def test_life_insurance_and_per_are_read_as_balance_only_accounts(self):
+        equipment = {
+            "financialPortfolio": {
+                "lifeInsurance": {"accounts": [{
+                    "id": "AVWEBID",
+                    "label": "SYNTHETIC HOLDER",
+                    "accountNumber": "0000AV",
+                    "type": {"label": "Assurance vie", "value": "life-insurance"},
+                    "balance": {"amount": "2500.50", "currency": "EUR"},
+                }]},
+                "retirementSavingsPlan": {"accounts": [{
+                    "id": "PERWEBID",
+                    "label": "SYNTHETIC HOLDER",
+                    "accountNumber": "0000PER",
+                    "type": {"label": "PER", "value": "retirement-savings-plan"},
+                    "balance": {"amount": "800", "currency": "EUR"},
+                }]},
+            },
+        }
+
+        folded = fold_cash_pockets_into_securities_accounts(
+            extract_accounts_from_equipment(equipment)
+        )
+
+        by_web_id = {a["webId"]: a for a in folded}
+        self.assertEqual(by_web_id["AVWEBID"]["type"], "ASSURANCE_VIE")
+        self.assertEqual(by_web_id["PERWEBID"]["type"], "PER")
+        self.assertEqual(by_web_id["AVWEBID"]["balanceEur"], decimal_value("2500.50"))
+        # No cash leg is invented for a product that only reports a balance.
+        self.assertIsNone(by_web_id["AVWEBID"]["cashBalance"])
+        self.assertIsNone(by_web_id["PERWEBID"]["cashBalance"])
+        self.assertEqual({"ASSURANCE_VIE", "PER"}, set(BALANCE_ONLY_TYPES))
+
+    def test_a_life_insurance_with_no_balance_is_kept_with_none_for_the_caller_to_reject(self):
+        equipment = {"financialPortfolio": {"lifeInsurance": {"accounts": [{
+            "id": "AVWEBID",
+            "type": {"label": "Assurance vie", "value": "life-insurance"},
+        }]}}}
+
+        accounts = extract_accounts_from_equipment(equipment)
+
+        self.assertIsNone(accounts[0]["balanceEur"])
+
+    def test_mortgages_and_external_accounts_stay_out_of_scope(self):
+        equipment = {"financialPortfolio": {
+            "mortgages": {"accounts": [{"id": "LOANID", "balance": {"amount": "1", "currency": "EUR"}}]},
+            "external": {"accounts": [{"id": "EXTID", "balance": {"amount": "1", "currency": "EUR"}}]},
+        }}
+
+        self.assertEqual(extract_accounts_from_equipment(equipment), [])
+
     def test_pea_cto_checking_and_cto_cash_pocket_are_all_kept_consistent(self):
         equipment = parse_equipment_multipart(EQUIPMENT_MULTIPART_FIXTURE)
 
@@ -319,6 +373,23 @@ class EquipmentGraphqlTest(unittest.TestCase):
 
 
 class AccountPayloadContractTest(unittest.TestCase):
+    def test_account_payload_accepts_balance_only_products_without_cash(self):
+        from main import AccountPayload
+
+        for account_type in ("ASSURANCE_VIE", "PER"):
+            payload = AccountPayload.model_validate({
+                "externalId": "acc-1",
+                "name": "Account",
+                "type": account_type,
+                "balanceEur": "100.00",
+                "cashBalance": None,
+                "positions": [],
+                "transactions": [],
+                "snapshotComplete": True,
+            })
+            self.assertEqual(payload.type, account_type)
+            self.assertIsNone(payload.cashBalance)
+
     def test_account_payload_accepts_all_four_supported_types(self):
         from main import AccountPayload
 
@@ -807,6 +878,23 @@ class TransactionParsingTest(unittest.IsolatedAsyncioTestCase):
 
         cash_fetch.assert_not_awaited()
 
+    async def test_balance_only_accounts_never_call_the_cash_api(self):
+        from main import _transactions_for_account
+
+        cash_fetch = AsyncMock(return_value=[{"date": "2026-01-01"}])
+        with patch("main._fetch_transactions", new=cash_fetch):
+            for account_type in ("ASSURANCE_VIE", "PER"):
+                with self.subTest(account_type=account_type):
+                    transactions = await _transactions_for_account(
+                        object(),
+                        "api-key",
+                        {"webId": "account-id", "type": account_type},
+                        [],
+                    )
+                    self.assertEqual(transactions, [])
+
+        cash_fetch.assert_not_awaited()
+
     async def test_cash_accounts_use_the_transaction_api(self):
         from main import _transactions_for_account
 
@@ -1260,3 +1348,84 @@ class NbspRepresentationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LIFE_INSURANCE_HTML = """
+<table class="css-x"><thead><tr>
+<th>Code ISIN Libellé</th><th>Performance</th><th>+/- Value financière</th><th>Montant</th>
+<th>Poids</th><th>Prix de revient</th><th>Nombre de parts</th><th>Valeur Liquidative</th><th>Date de valeur</th>
+</tr></thead><tbody>
+<tr><td><span>FR0000000001</span> <span>SYNTHETIC EURO FUND</span></td><td>-</td><td>-</td>
+<td>1&nbsp;000,00 €</td><td>50,00 %</td><td>-</td><td>-</td><td>-</td><td>01/01/2026</td></tr>
+<tr><td><span>FR0000000002</span> <span>SYNTHETIC UNIT FUND</span></td><td>+10,00 %</td><td>+100,00 €</td>
+<td>1&nbsp;100,00 €</td><td>50,00 %</td><td>{cost}</td><td>10,00</td><td>110,00 €</td><td>01/01/2026</td></tr>
+</tbody></table>
+"""
+
+
+class LifeInsurancePositionsTest(unittest.TestCase):
+    def test_euro_fund_is_an_amount_and_unit_fund_keeps_its_isin(self):
+        euro, unit = parse_life_insurance_positions(LIFE_INSURANCE_HTML.format(cost="1 000,00 €"))
+
+        self.assertIsNone(euro["isin"])
+        self.assertEqual("FR0000000001", euro["symbol"])
+        self.assertEqual("SYNTHETIC EURO FUND", euro["label"])
+        self.assertEqual(Decimal("1000.00"), euro["quantity"])
+        self.assertEqual(Decimal("1"), euro["currentPrice"])
+        self.assertEqual(Decimal("1"), euro["buyingPriceEur"])
+        self.assertEqual(Decimal("1000.00"), euro["currentValueEur"])
+        self.assertEqual("FR0000000002", unit["isin"])
+        self.assertEqual(Decimal("10.00"), unit["quantity"])
+        self.assertEqual(Decimal("110.00"), unit["currentPrice"])
+        self.assertEqual(Decimal("1100.00"), unit["currentValueEur"])
+        self.assertEqual(Decimal("100.00"), unit["pnlEur"])
+
+    def test_cost_is_read_as_a_total_when_it_matches_amount_minus_gain(self):
+        unit = parse_life_insurance_positions(LIFE_INSURANCE_HTML.format(cost="1 000,00 €"))[1]
+        self.assertEqual(Decimal("100"), unit["buyingPriceEur"])
+
+    def test_cost_is_read_as_per_unit_when_it_matches_units_times_cost(self):
+        unit = parse_life_insurance_positions(LIFE_INSURANCE_HTML.format(cost="100,00 €"))[1]
+        self.assertEqual(Decimal("100.00"), unit["buyingPriceEur"])
+
+    def test_ambiguous_cost_is_not_guessed(self):
+        unit = parse_life_insurance_positions(LIFE_INSURANCE_HTML.format(cost="555,00 €"))[1]
+        self.assertIsNone(unit["buyingPriceEur"])
+        self.assertEqual(Decimal("100.00"), unit["pnlEur"])
+
+    def test_page_without_the_table_has_no_positions(self):
+        self.assertEqual([], parse_life_insurance_positions("<html>login</html>"))
+
+    def test_row_that_does_not_fit_the_headers_is_rejected(self):
+        broken = LIFE_INSURANCE_HTML.format(cost="-").replace("<td>01/01/2026</td></tr>\n</tbody>", "</tr></tbody>")
+        with self.assertRaises(PortfolioFormatError):
+            parse_life_insurance_positions(broken)
+
+    def test_life_insurance_link_is_mapped_to_its_own_segment(self):
+        ids = parse_legacy_account_ids(
+            '<a href="/fr/prive/mes-comptes/assurance-vie/situation-contrat/?ca=' + "a1" * 16 + '">x</a>'
+        )
+        self.assertEqual({"assurance-vie": "a1" * 16}, ids)
+
+
+class LifeInsuranceFetchTest(unittest.IsolatedAsyncioTestCase):
+    async def test_funds_matching_the_balance_are_kept(self):
+        from main import _fetch_life_insurance_positions
+
+        with patch("main._fetch_via_iframe", new=AsyncMock(return_value=LIFE_INSURANCE_HTML.format(cost="-"))):
+            positions = await _fetch_life_insurance_positions(object(), "ca", Decimal("2100.04"))
+        self.assertEqual(2, len(positions))
+
+    async def test_funds_that_do_not_add_up_leave_a_balance_only_account(self):
+        from main import _fetch_life_insurance_positions
+
+        with patch("main._fetch_via_iframe", new=AsyncMock(return_value=LIFE_INSURANCE_HTML.format(cost="-"))):
+            positions = await _fetch_life_insurance_positions(object(), "ca", Decimal("5000"))
+        self.assertEqual([], positions)
+
+    async def test_login_bounce_leaves_a_balance_only_account(self):
+        from main import _fetch_life_insurance_positions
+
+        with patch("main._fetch_via_iframe", new=AsyncMock(return_value='<input name="LOGIN">')):
+            positions = await _fetch_life_insurance_positions(object(), "ca", Decimal("2100"))
+        self.assertEqual([], positions)

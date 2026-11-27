@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fortuneo: life insurance and PER.** The Fortuneo connector now reads the life insurance and the PER as
+  accounts of type `ASSURANCE_VIE` and `PER`. Their balance was already requested from Fortuneo, then
+  dropped. The life insurance also gets its funds (units, euro funds) from the contract page when they add
+  up to the balance; otherwise, and for the PER, only the balance is shown. Operations are not imported.
+
 - **French life-insurance companies in the manual account provider picker (#798).** When adding or
   editing a manual assurance vie or PER account, the provider field now suggests the main French
   insurers (CNP Assurances, Suravenir, Groupama, Abeille Assurances, Generali, Spirica, AXA,

@@ -49,6 +49,13 @@ fn checking(balance: &str, transactions: Vec<Value>) -> Value {
     })
 }
 
+fn balance_only(kind: &str, balance: &str, positions: Vec<Value>) -> Value {
+    json!({
+        "externalId": format!("{kind}-1"), "name": kind, "type": kind, "balanceEur": n(balance),
+        "cashBalance": null, "positions": positions, "transactions": [], "snapshotComplete": true
+    })
+}
+
 fn tx(id: Option<&str>, date: &str, label: &str, amount: &str) -> Value {
     json!({ "externalId": id, "date": date, "label": label, "amount": n(amount) })
 }
@@ -323,6 +330,91 @@ async fn a_mixed_portfolio_commits_every_account_with_its_snapshot() {
             Some("FR0000120271".into())
         )
     );
+}
+
+#[tokio::test]
+async fn a_life_insurance_and_a_per_are_stored_with_their_balance_only() {
+    let s = Synced::new().await;
+
+    let after = s
+        .sync(json!([
+            balance_only("ASSURANCE_VIE", "2500.50", vec![]),
+            balance_only("PER", "800", vec![]),
+        ]))
+        .await;
+
+    assert_eq!(after["syncStatus"], "SUCCESS");
+    let accounts: Vec<(String, Option<Decimal>, String)> =
+        picsou::db::query_as("SELECT type::text, cash_balance, color FROM account ORDER BY id")
+            .fetch_all(&s.app.state.db)
+            .await
+            .unwrap();
+    // No cash leg is invented for a product that reports a single balance.
+    assert_eq!(
+        accounts,
+        vec![
+            ("ASSURANCE_VIE".into(), None, "#8b5cf6".into()),
+            ("PER".into(), None, "#8b5cf6".into()),
+        ]
+    );
+    let balances: Vec<Decimal> =
+        picsou::db::query_scalar("SELECT balance FROM balance_snapshot ORDER BY account_id")
+            .fetch_all(&s.app.state.db)
+            .await
+            .unwrap();
+    assert_eq!(balances, vec![d("2500.50"), d("800")]);
+    assert_eq!(
+        count(&s.app, "SELECT count(*) FROM account_holding").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_life_insurance_with_funds_keeps_them_and_derives_its_invested_amount() {
+    let s = Synced::new().await;
+    let mut euro = position(None, "EURO-FUND", "1000", "1000");
+    euro["buyingPriceEur"] = json!(1);
+    euro["currentPrice"] = json!(1);
+    euro["pnlEur"] = Value::Null;
+    let mut unit = position(None, "UNIT-FUND", "10", "1100");
+    unit["buyingPriceEur"] = json!(100);
+    unit["currentPrice"] = json!(110);
+    unit["pnlEur"] = json!(100);
+
+    let after = s
+        .sync(json!([balance_only(
+            "ASSURANCE_VIE",
+            "2100",
+            vec![euro, unit]
+        )]))
+        .await;
+
+    assert_eq!(after["syncStatus"], "SUCCESS");
+    assert_eq!(
+        count(&s.app, "SELECT count(*) FROM account_holding").await,
+        2
+    );
+    let snapshot: (Decimal, Decimal) =
+        picsou::db::query_as("SELECT balance, invested_amount FROM balance_snapshot")
+            .fetch_one(&s.app.state.db)
+            .await
+            .unwrap();
+    assert_eq!(snapshot.0, d("2100"));
+}
+
+#[tokio::test]
+async fn funds_that_do_not_add_up_to_the_balance_refuse_the_whole_snapshot() {
+    let s = Synced::new().await;
+    let after = s
+        .sync(json!([balance_only(
+            "ASSURANCE_VIE",
+            "500",
+            vec![position(None, "A", "1", "100")]
+        )]))
+        .await;
+
+    assert_eq!(after["lastSyncError"], "PORTFOLIO_INCOMPLETE");
+    assert_eq!(count(&s.app, "SELECT count(*) FROM account").await, 0);
 }
 
 #[tokio::test]

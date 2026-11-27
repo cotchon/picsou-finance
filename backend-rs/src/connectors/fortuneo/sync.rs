@@ -31,6 +31,7 @@ use crate::ledger::sidecar::{SidecarBank, SidecarErrorCode, SourceSyncResult};
 use crate::ledger::sync_values::{
     clean, java_trim, limit, money_close, sum_complete, weighted_average,
 };
+use crate::ledger::valuation::{self, SnapshotContext};
 use crate::ledger::{holdings, members, snapshots, transactions};
 
 const BANK: SidecarBank = SidecarBank::Fortuneo;
@@ -101,8 +102,10 @@ pub struct PreparedAccount {
     name: String,
     account_type: AccountType,
     balance_eur: Decimal,
-    cash_balance: Decimal,
-    invested_amount_eur: Decimal,
+    /// None for a life insurance or a PER: Fortuneo gives them no cash leg.
+    cash_balance: Option<Decimal>,
+    /// None when the account has no cost basis of its own (a balance with no funds).
+    invested_amount_eur: Option<Decimal>,
     positions: Vec<PreparedPosition>,
     transactions: Vec<PreparedTransaction>,
 }
@@ -299,35 +302,61 @@ async fn prepare_accounts(
                     | AccountType::CompteTitres
                     | AccountType::Checking
                     | AccountType::Savings
+                    | AccountType::AssuranceVie
+                    | AccountType::Per
             )
         }) else {
             return Err(invalid("Fortuneo returned an unsupported account type"));
         };
-        let (Some(balance_eur), Some(cash_balance), Some(raw_positions)) =
-            (account.balance_eur, account.cash_balance, account.positions)
+        let balance_only = matches!(account_type, AccountType::AssuranceVie | AccountType::Per);
+        let (Some(balance_eur), Some(raw_positions)) = (account.balance_eur, account.positions)
         else {
             return Err(invalid("Fortuneo returned incomplete account values"));
         };
+        let cash_balance = match (account.cash_balance, balance_only) {
+            (Some(cash), _) => Some(cash),
+            (None, true) => None,
+            (None, false) => return Err(invalid("Fortuneo returned incomplete account values")),
+        };
         let positions = prepare_positions(state, raw_positions).await?;
-        let invested_amount_eur =
-            if matches!(account_type, AccountType::Checking | AccountType::Savings) {
-                // The whole balance is cash: nothing to reconcile against positions.
-                if !positions.is_empty() {
-                    return Err(invalid("Fortuneo returned positions for a cash account"));
-                }
-                if !money_close(cash_balance, balance_eur) {
-                    return Err(invalid(
-                        "Fortuneo returned a cash account whose balance does not match its cash",
-                    ));
-                }
-                balance_eur
+        let (cash_balance, invested_amount_eur) = if balance_only {
+            // A life insurance or a PER has one number: no cash is invented for it. Funds are
+            // optional; when present they must add up to the balance.
+            if positions.is_empty() {
+                (None, None)
             } else {
                 let position_value: Decimal = positions.iter().map(|p| p.current_value_eur).sum();
-                if !money_close(position_value, balance_eur - cash_balance) {
+                if !money_close(position_value, balance_eur) {
                     return Err(incomplete("Fortuneo returned an incomplete portfolio"));
                 }
-                invested_amount(balance_eur, cash_balance, &positions)
-            };
+                (
+                    None,
+                    Some(invested_amount(balance_eur, Decimal::ZERO, &positions)),
+                )
+            }
+        } else if matches!(account_type, AccountType::Checking | AccountType::Savings) {
+            let cash_balance = cash_balance.unwrap_or_default();
+            // The whole balance is cash: nothing to reconcile against positions.
+            if !positions.is_empty() {
+                return Err(invalid("Fortuneo returned positions for a cash account"));
+            }
+            if !money_close(cash_balance, balance_eur) {
+                return Err(invalid(
+                    "Fortuneo returned a cash account whose balance does not match its cash",
+                ));
+            }
+            (Some(cash_balance), Some(balance_eur))
+        } else {
+            let cash_balance = cash_balance.unwrap_or_default();
+            let position_value: Decimal = positions.iter().map(|p| p.current_value_eur).sum();
+            if !money_close(position_value, balance_eur - cash_balance) {
+                return Err(incomplete("Fortuneo returned an incomplete portfolio"));
+            }
+            (
+                Some(cash_balance),
+                Some(invested_amount(balance_eur, cash_balance, &positions)),
+            )
+        };
         let transactions = prepare_transactions(state, account.transactions).await?;
         prepared.push(PreparedAccount {
             external_id,
@@ -600,7 +629,7 @@ fn color_for(account_type: AccountType) -> &'static str {
         AccountType::Pea => "#10b981",
         AccountType::CompteTitres => "#3b82f6",
         AccountType::Checking => "#f59e0b",
-        AccountType::Savings => "#8b5cf6",
+        AccountType::Savings | AccountType::AssuranceVie | AccountType::Per => "#8b5cf6",
         _ => "#6b7280",
     }
 }
@@ -619,8 +648,8 @@ async fn upsert_account(
         provider: PROVIDER,
         color: color_for(data.account_type),
         balance_eur: data.balance_eur,
-        cash_balance: Some(data.cash_balance),
-        invested_eur: data.invested_amount_eur,
+        cash_balance: data.cash_balance,
+        invested_eur: data.invested_amount_eur.unwrap_or(data.balance_eur),
     };
     let Some(saved) =
         portfolio::upsert_account(state, conn, member_id, &account, synced_at).await?
@@ -648,15 +677,21 @@ async fn upsert_account(
         .collect();
     holdings::replace_all(&mut *conn, saved.id, &drafts, now).await?;
     sync_transactions(conn, &saved, &data.transactions, today, now).await?;
-    snapshots::upsert(
-        &mut *conn,
-        saved.id,
-        data.balance_eur,
-        data.invested_amount_eur,
-        today,
-        now,
-    )
-    .await?;
+    match data.invested_amount_eur {
+        Some(invested) => {
+            snapshots::upsert(&mut *conn, saved.id, data.balance_eur, invested, today, now).await?;
+        }
+        None => {
+            // No cost basis from the provider: let the ledger derive it, as the other
+            // balance-only connectors do (the snapshot column is NOT NULL).
+            let ctx = SnapshotContext {
+                prices: &*state.ledger.prices,
+                today,
+                now,
+            };
+            valuation::upsert_snapshot(&mut *conn, &ctx, &saved, data.balance_eur, today).await?;
+        }
+    }
     // A sync writes one point dated today; the ledger just imported establishes the days before.
     history::reconstruct(conn, &saved, data.balance_eur, today, now).await?;
     Ok(())

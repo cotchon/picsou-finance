@@ -16,6 +16,7 @@ Supported data:
 
 - current accounts and savings accounts;
 - PEA, PEA-PME and CTO securities accounts;
+- life insurance and PER, with their funds when the contract page lists them (see [Life insurance and PER](#life-insurance-and-per));
 - current balances and securities positions;
 - cash-account transactions returned by Fortuneo;
 - securities operations from the legacy history page;
@@ -95,6 +96,8 @@ or multipart gaps invalidate the whole response.
 | PEA | `PEA` |
 | PEA-PME | `PEA` |
 | CTO | `COMPTE_TITRES` |
+| Life insurance | `ASSURANCE_VIE` |
+| PER | `PER` |
 
 PEA-PME intentionally shares Picsou's `PEA` type because the domain has no
 separate type. Its provider subtype remains available to select the correct
@@ -108,6 +111,35 @@ securities account later receives its cash from its own legacy portfolio page.
 Every provider account uses a stable external identifier. The backend upserts
 within the current member and provider scope and never matches accounts by
 display label alone.
+
+## Life insurance and PER
+
+Fortuneo reports both products through the Equipment query, with a balance and
+no cash leg. They are therefore stored with that balance, no cash balance
+(`NULL`) and the same colour as other balance-only products.
+
+**Life insurance funds.** The sidecar opens the contract page of the legacy
+site (`assurance-vie/situation-contrat/`, through the same iframe as the
+securities pages) and reads its valuation table by header name. A row with a
+share count and a net asset value is a fund in units (ISIN, quantity, price,
+value, gain). A row without them is a euro fund: a plain amount, modelled as a
+quantity equal to its amount at a price of 1, with no gain unless the page
+gives one. "Prix de revient" is read as a total when it equals the amount minus
+the gain and as a per-unit price when units times it does; otherwise it is
+ignored rather than guessed.
+
+The sidecar sends the funds only when their sum matches the contract balance
+(5 cents). Any failure, bounce to the login page or mismatch leaves a
+balance-only account. The backend re-checks the same sum and rejects the
+snapshot with `PORTFOLIO_INCOMPLETE` when it fails. With funds, the invested
+amount is their cost basis; without them it is derived from the ledger, as
+other balance-only connectors do. When the customer holds several contracts,
+the first one linked from the legacy home page is read.
+
+**PER.** No page is known for its funds or history: it stays a balance.
+
+**History.** Operations of both products are not imported: no source is
+established for them.
 
 ## Portfolio collection
 

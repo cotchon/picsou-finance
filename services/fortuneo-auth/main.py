@@ -34,6 +34,8 @@ from playwright.async_api import (
 
 from fortuneo_parser import (
     PortfolioFormatError,
+    BALANCE_ONLY_TYPES,
+    LIFE_INSURANCE_SEGMENT,
     PRODUCT_TYPE_TO_PORTFOLIO_SEGMENT,
     decimal_value,
     extract_accounts_from_equipment,
@@ -46,6 +48,7 @@ from fortuneo_parser import (
     parse_securities_history,
     parse_securities_referential,
     parse_legacy_account_ids,
+    parse_life_insurance_positions,
     parse_portfolio_positions,
     parse_portfolio_summary,
 )
@@ -413,9 +416,10 @@ class AccountPayload(BaseModel):
 
     externalId: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=200)
-    type: Literal["PEA", "COMPTE_TITRES", "CHECKING", "SAVINGS"]
+    type: Literal["PEA", "COMPTE_TITRES", "CHECKING", "SAVINGS", "ASSURANCE_VIE", "PER"]
     balanceEur: Decimal
-    cashBalance: Decimal
+    # None only for the balance-only products (life insurance, PER): they have no cash leg.
+    cashBalance: Decimal | None
     positions: list[PositionPayload]
     transactions: list[TransactionPayload] = Field(default_factory=list)
     snapshotComplete: Literal[True]
@@ -1503,6 +1507,10 @@ async def _transactions_for_account(
     securities_ledger: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Select the only transaction source that can answer for this product."""
+    if account["type"] in BALANCE_ONLY_TYPES:
+        # No ledger source is established for a life insurance or a PER, and an
+        # empty list leaves existing rows alone on the backend side.
+        return []
     if account["type"] in ("PEA", "COMPTE_TITRES"):
         return securities_ledger
     return await _fetch_transactions(page, api_key, account["webId"], account["type"])
@@ -1546,6 +1554,43 @@ def _portfolio_snapshot(html: str) -> dict[str, Any] | None:
         "securitiesEur": securities,
         "totalEur": account_total,
     }
+
+
+# Matches the backend's own check, so positions it would reject are never sent.
+LIFE_INSURANCE_RECONCILE_TOLERANCE_EUR = Decimal("0.05")
+LIFE_INSURANCE_URL_TEMPLATE = (
+    f"{BASE_URL}/fr/prive/mes-comptes/assurance-vie/situation-contrat/?ca={{ca}}&iframe=true"
+)
+
+
+async def _fetch_life_insurance_positions(
+    page: Page, legacy_ca: str, balance: Decimal
+) -> list[dict[str, Any]]:
+    """Read a life insurance's funds from its contract page.
+
+    The balance already comes from Equipment, so this is best effort: any
+    failure, or funds that do not add up to that balance, yields no positions
+    and the account stays a balance-only one rather than showing a partial
+    portfolio.
+    """
+    try:
+        html = await _fetch_via_iframe(page, LIFE_INSURANCE_URL_TEMPLATE.format(ca=legacy_ca))
+        if _is_login_page(html):
+            log.warning("Fortuneo life insurance page was bounced to the login form")
+            return []
+        positions = parse_life_insurance_positions(html)
+    except (PlaywrightError, PortfolioFormatError, HTTPException):
+        log.warning("Fortuneo life insurance positions unavailable", exc_info=True)
+        return []
+    total = sum((p["currentValueEur"] for p in positions), start=Decimal("0"))
+    if not positions or abs(total - balance) > LIFE_INSURANCE_RECONCILE_TOLERANCE_EUR:
+        log.warning(
+            "Fortuneo life insurance funds do not match the contract balance "
+            "(positions=%s); keeping a balance-only account",
+            len(positions),
+        )
+        return []
+    return positions
 
 
 async def _fetch_positions(page: Page, segment: str, legacy_ca: str) -> dict[str, Any]:
@@ -1706,7 +1751,18 @@ async def accounts(req: AccountsRequest) -> list[AccountPayload]:
                         "portfolio page; using the portfolio page"
                     )
 
-            if account["cashBalance"] is None:
+            if account["type"] == "ASSURANCE_VIE":
+                if legacy_page is None:
+                    legacy_page, legacy_ids = await _open_legacy_frontend(context)
+                legacy_ca = legacy_ids.get(LIFE_INSURANCE_SEGMENT)
+                if legacy_ca is None:
+                    log.warning("Fortuneo legacy home page has no life insurance link")
+                else:
+                    positions = await _fetch_life_insurance_positions(
+                        legacy_page, legacy_ca, account["balanceEur"]
+                    )
+
+            if account["cashBalance"] is None and account["type"] not in BALANCE_ONLY_TYPES:
                 raise HTTPException(status_code=502, detail="PORTFOLIO_INCOMPLETE")
 
             # Securities accounts use the legacy ledger because the transaction

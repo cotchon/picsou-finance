@@ -127,7 +127,13 @@ _EQUIPMENT_CATEGORY_ACCOUNT_TYPE: dict[tuple[str, str], str] = {
     ("financialPortfolio", "ordinarySecurities"): "COMPTE_TITRES",
     ("banking", "current"): "CHECKING",
     ("banking", "savings"): "SAVINGS",
+    ("financialPortfolio", "lifeInsurance"): "ASSURANCE_VIE",
+    ("financialPortfolio", "retirementSavingsPlan"): "PER",
 }
+# Products Fortuneo reports as one balance only: no positions, no cash leg and no
+# ledger the sidecar can read. They are sent with `cashBalance = None` and an empty
+# position and transaction list, never with a guessed cash or invested amount.
+BALANCE_ONLY_TYPES: frozenset[str] = frozenset({"ASSURANCE_VIE", "PER"})
 # A CTO's linked cash pocket: not a standalone Picsou account (see module
 # docstring) -- extracted separately so callers can fold its balance into
 # the parent CTO via `fold_cash_pockets_into_securities_accounts`.
@@ -219,9 +225,10 @@ def extract_accounts_from_equipment(equipment: dict[str, Any]) -> list[dict[str,
     `PRODUCT_TYPE_TO_PORTFOLIO_SEGMENT`). `typeLabel` is Fortuneo's own
     display label for the account type (e.g. "PEA", "Compte courant"), kept
     for building a human-readable account name -- Fortuneo's `label` field
-    is just the holder's name, not a per-account name. `lifeInsurance`,
-    `retirementSavingsPlan` (PER), `mortgages`, and `external` accounts are
-    out of scope and skipped entirely.
+    is just the holder's name, not a per-account name. `lifeInsurance` and
+    `retirementSavingsPlan` (PER) are read as balance-only accounts (see
+    `BALANCE_ONLY_TYPES`); `mortgages` and `external` accounts are out of scope
+    and skipped entirely.
     """
     if not isinstance(equipment, dict):
         raise PortfolioFormatError("Equipment root was not an object")
@@ -435,6 +442,11 @@ _LEGACY_ACCOUNT_LINK = re.compile(
     r"\?ca=(?P<ca>[0-9a-f]{32})"
 )
 
+
+LIFE_INSURANCE_SEGMENT = "assurance-vie"
+_LEGACY_LIFE_INSURANCE_LINK = re.compile(
+    r"/fr/prive/mes-comptes/assurance-vie/situation-contrat/\?ca=(?P<ca>[0-9A-Za-z]{16,64})"
+)
 
 _TAGS = re.compile(r"<[^>]+>")
 _WHITESPACE = re.compile(r"\s+")
@@ -718,6 +730,11 @@ def parse_legacy_account_ids(html: str) -> dict[str, str]:
     ids: dict[str, str] = {}
     for match in _LEGACY_ACCOUNT_LINK.finditer(html):
         ids.setdefault(match.group("segment"), match.group("ca"))
+    # A life insurance uses its own route (`situation-contrat`), keyed by the
+    # same kind of `ca` identifier. With several contracts the first link wins.
+    life_insurance = _LEGACY_LIFE_INSURANCE_LINK.search(html)
+    if life_insurance:
+        ids.setdefault(LIFE_INSURANCE_SEGMENT, life_insurance.group("ca"))
     return ids
 
 
@@ -770,3 +787,128 @@ def parse_portfolio_summary(html: str) -> dict[str, Any]:
                     found[key] = optional_decimal_value(value, key)
                 break
     return found
+
+
+# --- Life insurance valuation -------------------------------------------------
+#
+# The contract page (`assurance-vie/situation-contrat/`) renders one table with
+# these headers, in this order (matched by name, not by position):
+#
+#     Code ISIN Libelle | Performance | +/- Value financiere | Montant | Poids |
+#     Prix de revient | Nombre de parts | Valeur Liquidative | Date de valeur
+#
+# A fund in units has a share count and a net asset value. A euro fund has "-"
+# for both: it is a plain amount, modelled as `quantity = amount` at a price of 1.
+_ISIN_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
+_TABLE = re.compile(r"<table\b.*?</table>", re.IGNORECASE | re.DOTALL)
+_ROW = re.compile(r"<tr\b[^>]*>(?P<body>.*?)</tr>", re.IGNORECASE | re.DOTALL)
+_HEADER_CELL = re.compile(r"<th\b[^>]*>(?P<cell>.*?)</th>", re.IGNORECASE | re.DOTALL)
+_DATA_CELL = re.compile(r"<td\b[^>]*>(?P<cell>.*?)</td>", re.IGNORECASE | re.DOTALL)
+_LIFE_INSURANCE_COLUMNS = {
+    "code": "code isin",
+    "pnl": "value financiere",
+    "amount": "montant",
+    "cost": "prix de revient",
+    "units": "nombre de parts",
+    "nav": "valeur liquidative",
+}
+_EMPTY_CELL = {"", "-", "--", "n/a", "nc"}
+_COST_TOLERANCE_EUR = Decimal("1.00")
+
+
+def _cell_decimal(text: str, field: str) -> Decimal | None:
+    value = text.strip()
+    if value.lower() in _EMPTY_CELL:
+        return None
+    return decimal_value(value, field)
+
+
+def _life_insurance_cost(
+    cost: Decimal | None,
+    units: Decimal,
+    amount: Decimal,
+    pnl: Decimal | None,
+) -> Decimal | None:
+    """Return the per-unit cost, or None when the page leaves it ambiguous.
+
+    "Prix de revient" is read as a total when it equals amount minus gain, and
+    as a per-unit price when units times it does. Anything else is not guessed.
+    """
+    if cost is None or pnl is None or units == 0:
+        return None
+    expected_total = amount - pnl
+    if abs(cost - expected_total) <= _COST_TOLERANCE_EUR:
+        return expected_total / units
+    tolerance = max(_COST_TOLERANCE_EUR, units * Decimal("0.01"))
+    if abs(cost * units - expected_total) <= tolerance:
+        return cost
+    return None
+
+
+def parse_life_insurance_positions(html: str) -> list[dict[str, Any]]:
+    """Parse a life insurance contract's valuation table into holdings, in the
+    same shape as `parse_portfolio_positions`.
+
+    A page without the table (login bounce, layout change) returns an empty
+    list; a table whose rows do not fit its headers raises PortfolioFormatError
+    instead of shifting values into the wrong column.
+    """
+    html = _normalize_nbsp(html)
+    for table in _TABLE.finditer(html):
+        headers = [
+            _strip_accents(_text_of(m.group("cell"))).lower()
+            for m in _HEADER_CELL.finditer(table.group(0))
+        ]
+        if not any(h.startswith("code isin") for h in headers):
+            continue
+        index: dict[str, int] = {}
+        for key, name in _LIFE_INSURANCE_COLUMNS.items():
+            matches = [i for i, h in enumerate(headers) if name in h]
+            if len(matches) != 1:
+                raise PortfolioFormatError("life insurance table header changed")
+            index[key] = matches[0]
+        positions: list[dict[str, Any]] = []
+        for row in _ROW.finditer(table.group(0)):
+            cells = [_text_of(m.group("cell")) for m in _DATA_CELL.finditer(row.group("body"))]
+            if not cells:
+                continue
+            if len(cells) != len(headers):
+                raise PortfolioFormatError("life insurance row does not match its headers")
+            code, _, label = cells[index["code"]].partition(" ")
+            label = label.strip() or code
+            amount = _cell_decimal(cells[index["amount"]], "currentValueEur")
+            if not code or amount is None:
+                raise PortfolioFormatError("life insurance row is missing code or amount")
+            pnl = _cell_decimal(cells[index["pnl"]], "pnlEur")
+            units = _cell_decimal(cells[index["units"]], "quantity")
+            nav = _cell_decimal(cells[index["nav"]], "currentPrice")
+            cost = _cell_decimal(cells[index["cost"]], "buyingPriceEur")
+            if units is None or nav is None:
+                # Euro fund: a plain amount.
+                positions.append({
+                    "isin": None,
+                    "symbol": code,
+                    "label": label,
+                    "quantity": amount,
+                    # The page reports no gain for a euro fund (interest is
+                    # credited into the amount), so its cost is its amount.
+                    "buyingPriceEur": Decimal("1") if pnl is None else None,
+                    "currentPrice": Decimal("1"),
+                    "quoteCurrency": "EUR",
+                    "currentValueEur": amount,
+                    "pnlEur": pnl,
+                })
+                continue
+            positions.append({
+                "isin": code if _ISIN_PATTERN.match(code) else None,
+                "symbol": code,
+                "label": label,
+                "quantity": units,
+                "buyingPriceEur": _life_insurance_cost(cost, units, amount, pnl),
+                "currentPrice": nav,
+                "quoteCurrency": "EUR",
+                "currentValueEur": amount,
+                "pnlEur": pnl,
+            })
+        return positions
+    return []
